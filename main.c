@@ -15,23 +15,20 @@
 #include <fcntl.h>
 #include <errno.h> 
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 200
 #define PORT 130
+#define BUFSIZE 102400
 
 struct event_data // Used by epoll_data_t.ptr
 {
     int type; // 0 for client, 1 for connect cmd
-    int status;
+    int state;
     int fd;
-    int pairfd;
+    void* pairptr;
     char* sendbuf;
     int sendbuflen;
     char* recvbuf;
     int recvbuflen;
-    char* pairsendbuf;
-    int pairsendbuflen;
-    char* pairrecvbuf; 
-    int pairrecvbuflen;
 };
 
 // {{{ Function: setnonblocking
@@ -95,9 +92,9 @@ void truncatemem(char** recvbuf, int* recvbuflen, int offset)
 
 int recvdata(int epfd, int fd, char** recvbuf, int* recvbuflen)
 {
-    char buf[BUFSIZ];
+    char buf[BUFSIZE];
     int n = 0, nread = 0;
-    while ((nread = read(fd, buf + n, BUFSIZ-1)) > 0) {
+    while ((nread = read(fd, buf + n, BUFSIZE-1)) > 0) {
         n += nread;
     }
     if (nread == -1 && errno != EAGAIN) {
@@ -110,117 +107,180 @@ int recvdata(int epfd, int fd, char** recvbuf, int* recvbuflen)
         }
         return 1;
     }
-    (*recvbuf) = (char*)realloc((*recvbuf), (*recvbuflen) + n*sizeof(char)); 
-    memcpy((*recvbuf) + (*recvbuflen), buf, n);
+    (*recvbuf) = (char*)realloc(*recvbuf, (*recvbuflen + n)*sizeof(char)); 
+    memcpy((*recvbuf) + (*recvbuflen), buf, n * sizeof(char));
     (*recvbuflen) = *recvbuflen + n;
     return 0;
 }
 
-// {{{ Fucntion: Socks5StateMachineClient
-int Socks5StateMachineClient(int* state, int i, char** recvbuf, int* recvbuflen, char** sendbuf, int* sendbuflen)
+// {{{ Function: rmfromepoll
+void rmfromepoll(int epfd, struct event_data* data_ptr)
 {
-        if(*state == 0)
-        {
-            if(*recvbuflen >= 3) {
-                truncatemem(recvbuf, recvbuflen, 3);
-                char response[2];
-                response[0] = 0x05;
-                response[1] = 0x00;
+    printf("disconnected\n");
+    if(data_ptr->sendbuf != NULL) {
+        free(data_ptr->sendbuf);
+    }
+    if(data_ptr->recvbuf != NULL) {
+        free(data_ptr->recvbuf);
+    }
+    epoll_ctl(epfd, EPOLL_CTL_DEL, data_ptr->fd, NULL);
+    if(close(data_ptr->fd) != 0) {
+        perror("close");
+    }
+    free(data_ptr);
+}
+// }}}
 
-                *sendbuf = realloc(*sendbuf, 2*sizeof(char));
-                memcpy(*sendbuf, response, 2); // Response of Socks5 protocal handshake ( no validation )
-                *sendbuflen = 2;
-                *state = 1;
-                printf("handshake\n");
+// {{{ Fucntion: Socks5StateMachineClient
+int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
+{
+    int* state = &(data_ptr->state);
+    char** recvbuf = &(data_ptr->recvbuf);
+    int* recvbuflen = &(data_ptr->recvbuflen);
+    char** sendbuf = &(data_ptr->sendbuf);
+    int* sendbuflen = &(data_ptr->sendbuflen);
+    if(*state == 0)
+    {
+        if(*recvbuflen >= 3) {
+            truncatemem(recvbuf, recvbuflen, 3);
+            char response[2];
+            response[0] = 0x05;
+            response[1] = 0x00;
+
+            *sendbuf = realloc(*sendbuf, 2*sizeof(char));
+            memcpy(*sendbuf, response, 2); // Response of Socks5 protocal handshake ( no validation )
+            *sendbuflen = 2;
+            *state = 1;
+            printf("handshake\n");
+        } 
+    }
+    else if(*state == 1)
+    {
+        char response = 0x07;
+        char ipaddress[20] = {0};
+        uint16_t port;
+        printf("decode request recvbuflen %d\n", *recvbuflen);
+        if(*recvbuflen > 4) {
+            printf("decode request atyp %d\n", (unsigned int)(*recvbuf)[3]);
+            switch((unsigned int)(*recvbuf)[3])
+            {
+                case 0x01: // IPv4
+                    if(*recvbuflen > 8) {
+                        snprintf(ipaddress, 20, "%u.%u.%u.%u", (unsigned int)((unsigned char)(*recvbuf)[4]), (unsigned int)((unsigned char)(*recvbuf)[5]), (unsigned int)((unsigned char)(*recvbuf)[6]), (unsigned int)((unsigned char)(*recvbuf)[7])); // pay attention to range of unsigned char
+                        truncatemem(recvbuf, recvbuflen, 8); 
+                        port = ntohs(*(uint16_t*)(*recvbuf)); // net order to host order
+                        truncatemem(recvbuf, recvbuflen, 2); 
+                    }
+                    break;
+                case 0x03: // Domain, not implement yet
+                    {
+                        int offset = 0;
+                        char domainlen = (*recvbuf)[4];
+                        char* domain = (char*)malloc(((unsigned int)(unsigned char)domainlen)*sizeof(char));
+                        memcpy(domain, *recvbuf + 5, (unsigned int)domainlen);
+                        hostname_to_ip(domain, ipaddress);
+                        free(domain); 
+                        offset += 1 + (unsigned int)domainlen;
+                        truncatemem(recvbuf, recvbuflen, 4 + offset);
+                    }
+                    break;
+                case 0x04:
+                    break;
+                default:
+                    response = 0x08;
+                    break;
+            }
+        }
+        if(strnlen(ipaddress, 8) != 0 && response == 0x07) {
+            printf("request %s:%u\n", ipaddress, port); 
+            response = 0x00;
+            *sendbuf = (char*)malloc(10 * sizeof(char));
+            (*sendbuf)[0] = 0x05;
+            (*sendbuf)[1] = response;
+            (*sendbuf)[2] = 0x00;
+            (*sendbuf)[3] = 0x01; // Always ipv4
+            (*sendbuf)[4] = 0x00;
+            (*sendbuf)[5] = 0x00;
+            (*sendbuf)[6] = 0x00;
+            (*sendbuf)[7] = 0x00;
+            (*sendbuf)[8] = 0x00;
+            (*sendbuf)[9] = 0x00;
+            *sendbuflen = 10;
+            // Prepare for connect
+            int connectfd = socket(AF_INET, SOCK_STREAM, 0);
+            if(connectfd < 0) {
+                perror("connect");
+                *state = -1;
             } 
-        }
-        else if(*state == 1)
-        {
-            char response = 0x07;
-            char ipaddress[20] = {0};
-            uint16_t port;
-            printf("decode request recvbuflen %d\n", *recvbuflen);
-            if(*recvbuflen > 4) {
-                printf("decode request atyp %d\n", (unsigned int)(*recvbuf)[3]);
-                switch((unsigned int)(*recvbuf)[3])
-                {
-                    case 0x01: // IPv4
-                        if(*recvbuflen > 8) {
-                            snprintf(ipaddress, 20, "%u.%u.%u.%u", (unsigned int)((unsigned char)(*recvbuf)[4]), (unsigned int)((unsigned char)(*recvbuf)[5]), (unsigned int)((unsigned char)(*recvbuf)[6]), (unsigned int)((unsigned char)(*recvbuf)[7])); // pay attention to range of unsigned char
-                            truncatemem(recvbuf, recvbuflen, 8); 
-                            port = ntohs(*(uint16_t*)(*recvbuf)); // net order to host order
-                            truncatemem(recvbuf, recvbuflen, 2); 
-                        }
-                        break;
-                    case 0x03: // Domain, not implement yet
-                        {
-                            int offset = 0;
-                            char domainlen = (*recvbuf)[4];
-                            char* domain = (char*)malloc(((unsigned int)(unsigned char)domainlen)*sizeof(char));
-                            memcpy(domain, *recvbuf + 5, (unsigned int)domainlen);
-                            hostname_to_ip(domain, ipaddress);
-                            free(domain); 
-                            offset += 1 + (unsigned int)domainlen;
-                            truncatemem(recvbuf, recvbuflen, 4 + offset);
-                        }
-                        break;
-                    case 0x04:
-                        break;
-                    default:
-                        response = 0x08;
-                        break;
-                }
+            struct sockaddr_in addr;  
+            bzero(&addr, sizeof(addr));  
+            addr.sin_family = AF_INET;  
+            addr.sin_port = htons(port);  
+            addr.sin_addr.s_addr = inet_addr(ipaddress);  
+            setnonblocking(connectfd);
+
+            connect(connectfd, (const struct sockaddr*)&addr, sizeof(addr));
+
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDHUP | EPOLLET;
+            ev.data.ptr = malloc(sizeof(struct event_data));
+            memset(ev.data.ptr, 0, sizeof(struct event_data)); // May cause strange problem. http://stackoverflow.com/questions/11152160/initializing-a-struct-to-0
+            ((struct event_data*)ev.data.ptr)->fd = connectfd;
+            ((struct event_data*)ev.data.ptr)->type = 1;
+            ((struct event_data*)ev.data.ptr)->pairptr = data_ptr;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, connectfd,
+                        &ev) == -1) {
+                perror("epoll_ctl: add");
+                exit(EXIT_FAILURE);
             }
-            if(strnlen(ipaddress, 8) != 0 && response == 0x07) {
-                printf("request %s:%u\n", ipaddress, port); 
-                response = 0x00;
-                *sendbuf = (char*)malloc(10 * sizeof(char));
-                (*sendbuf)[0] = 0x05;
-                (*sendbuf)[1] = response;
-                (*sendbuf)[2] = 0x00;
-                (*sendbuf)[3] = 0x01; // Always ipv4
-                (*sendbuf)[4] = 0x00;
-                (*sendbuf)[5] = 0x00;
-                (*sendbuf)[6] = 0x00;
-                (*sendbuf)[7] = 0x00;
-                (*sendbuf)[8] = 0x00;
-                (*sendbuf)[9] = 0x00;
-                *sendbuflen = 10;
-                *state = 2;
-            }
+            data_ptr->pairptr = ev.data.ptr;
+
+            *state = 2;
         }
-        else if(*state == 2) {
-            printf("%s\n", *recvbuf);
-            return 1;
-        }
-        return 0;
+    }
+    else if(*state == 2) {
+        struct event_data* pairptr = (struct event_data*)(data_ptr->pairptr);
+        pairptr->sendbuf = (char*)realloc(pairptr->sendbuf, (pairptr->sendbuflen + data_ptr->recvbuflen) * sizeof(char));
+        memcpy(pairptr->sendbuf + pairptr->sendbuflen, data_ptr->recvbuf, data_ptr->recvbuflen);
+        pairptr->sendbuflen += data_ptr->recvbuflen;
+
+        free(data_ptr->recvbuf);
+        data_ptr->recvbuf = NULL;
+        data_ptr->recvbuflen = 0;
+    }
+    else if(*state == -1) {
+        return 1;
+    }
+    return 0;
 }
 // }}}
 
 int main(){
     struct epoll_event ev, events[MAX_EVENTS];
     int addrlen, listenfd, conn_sock, nfds, epfd, fd, i, n;
+    int so_reuseaddr = 1;
+    struct event_data* data_ptr;
     struct sockaddr_in local, remote;
-    char* clientrecvbuf[MAX_EVENTS] = {NULL};
-    char* clientsendbuf[MAX_EVENTS] = {NULL};
-    int clientstatus[MAX_EVENTS] = {0};
-    int clientsendbuflen[MAX_EVENTS] = {0};
-    int clientrecvbuflen[MAX_EVENTS] = {0};
 
     if( (listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("sockfd\n");
+        perror("sockfd");
         exit(1);
     }
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &so_reuseaddr, sizeof(so_reuseaddr));
     setnonblocking(listenfd);
     bzero(&local, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_ANY);;
     local.sin_port = htons(PORT);
     if( bind(listenfd, (struct sockaddr *) &local, sizeof(local)) < 0) {
-        perror("bind\n");
+        perror("bind");
         exit(1);
     }
-    listen(listenfd, 20);
+
+    if(listen(listenfd, 100) < 0) {
+        perror("listen");
+        exit(1);
+    }
 
     epfd = epoll_create(MAX_EVENTS); // Create epoll fd for accept client
     if (epfd == -1) {
@@ -246,11 +306,12 @@ int main(){
 
         for (i = 0; i < nfds; ++i) {
             fd = ((struct event_data*)events[i].data.ptr)->fd;
+            data_ptr = (struct event_data*)events[i].data.ptr;
             if (fd == listenfd) {
                 while ((conn_sock = accept(listenfd,(struct sockaddr *) &remote, 
                                 (socklen_t *)&addrlen)) > 0) {
                     setnonblocking(conn_sock);
-                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET;
                     ev.data.ptr = malloc(sizeof(struct event_data));
                     memset(ev.data.ptr, 0, sizeof(struct event_data)); // May cause strange problem. http://stackoverflow.com/questions/11152160/initializing-a-struct-to-0
                     ((struct event_data*)ev.data.ptr)->fd = conn_sock;
@@ -268,53 +329,38 @@ int main(){
                 continue;
             }  
             if (events[i].events & EPOLLIN) {
-                if(recvdata(epfd, fd, &clientrecvbuf[i], &clientrecvbuflen[i]) != 0) {
+                printf("recv\n");
+                if(recvdata(epfd, fd, &(data_ptr->recvbuf), &(data_ptr->recvbuflen)) != 0) {
                     continue;
                 }
-                /*
-                n = 0;
-                while ((nread = read(fd, buf + n, BUFSIZ-1)) > 0) {
-                    n += nread;
-                }
-                if (nread == -1 && errno != EAGAIN) {
-                    perror("read error");
-                }
-                if (nread == 0) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                    if(close(fd) != 0) {
-                        perror("close");
+                if(data_ptr->type == 0) {
+                    if(Socks5StateMachineClient(data_ptr, epfd) != 0) {
+                        rmfromepoll(epfd, data_ptr);
+                        continue;
                     }
-                    continue;
-                }
-                clientrecvbuf[i] = (char*)realloc(clientrecvbuf[i], clientrecvbuflen[i] + n*sizeof(char)); 
-                memcpy(clientrecvbuf[i] + clientrecvbuflen[i], buf, n);
-                clientrecvbuflen[i] = clientrecvbuflen[i] + n;
-                */
-                printf("state 1  %d\n", clientstatus[i]);
-                
-                if(Socks5StateMachineClient(&clientstatus[i], i, &clientrecvbuf[i], &clientrecvbuflen[i], &clientsendbuf[i], &clientsendbuflen[i]) != 0) {
-                    free(events[i].data.ptr);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                    if(close(fd) != 0) {
-                        perror("close");
+                    ev.data.ptr = data_ptr;
+                    ev.events = events[i].events | EPOLLOUT; // Listen for EPOLLOUT
+                    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {
+                        perror("epoll_ctl: mod");
                     }
-                    continue;
                 }
-                printf("state 2  %d\n", clientstatus[i]);
+                else if(data_ptr->type == 1) {
+                    struct event_data* pairptr = (struct event_data*)(data_ptr->pairptr);
+                    pairptr->sendbuf = (char*)realloc(pairptr->sendbuf, (pairptr->sendbuflen + data_ptr->recvbuflen) * sizeof(char));
+                    memcpy(pairptr->sendbuf + pairptr->sendbuflen, data_ptr->recvbuf, data_ptr->recvbuflen * sizeof(char));
+                    pairptr->sendbuflen += data_ptr->recvbuflen;
 
-                ((struct event_data*)ev.data.ptr)->fd = fd;
-                ev.events = events[i].events | EPOLLOUT; // Listen for EPOLLOUT
-                if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {
-                    perror("epoll_ctl: mod");
+                    free(data_ptr->recvbuf);
+                    data_ptr->recvbuf = NULL;
+                    data_ptr->recvbuflen = 0;
                 }
             }
             if (events[i].events & EPOLLOUT) {
-                if(clientsendbuf[i] != NULL) {
-                    //Socks5StateMachineOUT(&clientstatus[i], i, &clientbuf[i], &clientbuflen[i]);
-                    int nwrite, data_size = clientsendbuflen[i];
-                    n = clientsendbuflen[i];
+                if((data_ptr->sendbuf) != NULL) {
+                    int nwrite, data_size = data_ptr->sendbuflen;
+                    n = data_ptr->sendbuflen;
                     while (n > 0) {
-                        nwrite = write(fd, clientsendbuf[i] + data_size - n, n);
+                        nwrite = write(fd, data_ptr->sendbuf + data_size - n, n);
                         if (nwrite < n) {
                             if (nwrite == -1 && errno != EAGAIN) {
                                 perror("write error");
@@ -323,17 +369,13 @@ int main(){
                         }
                         n -= nwrite;
                     }
-                    free(clientsendbuf[i]);
-                    clientsendbuf[i] = NULL;
-                    clientsendbuflen[i] = 0;
+                    free(data_ptr->sendbuf);
+                    data_ptr->sendbuf = NULL;
+                    data_ptr->sendbuflen = 0;
                 }
             }
-            if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
-                free(events[i].data.ptr);
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                if(close(fd) != 0) {
-                    perror("close");
-                }
+            if (events[i].events & (EPOLLRDHUP | EPOLLERR)) {
+                rmfromepoll(epfd, data_ptr);
             }
         }
         // }}}
