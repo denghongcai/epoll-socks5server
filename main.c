@@ -18,6 +18,23 @@
 #define MAX_EVENTS 10
 #define PORT 130
 
+struct event_data // Used by epoll_data_t.ptr
+{
+    int type; // 0 for client, 1 for connect cmd
+    int status;
+    int fd;
+    int pairfd;
+    char* sendbuf;
+    int sendbuflen;
+    char* recvbuf;
+    int recvbuflen;
+    char* pairsendbuf;
+    int pairsendbuflen;
+    char* pairrecvbuf; 
+    int pairrecvbuflen;
+};
+
+// {{{ Function: setnonblocking
 void setnonblocking(int sockfd) {
     int opts;
 
@@ -32,10 +49,11 @@ void setnonblocking(int sockfd) {
         exit(1);
     }
 }
+// }}}
 
+// {{{ Function: hostname_to_ip
 int hostname_to_ip(char *hostname , char *ip)
 {
-    int sockfd;  
     struct addrinfo hints, *servinfo, *p;
     struct sockaddr_in *h;
     int rv;
@@ -60,7 +78,9 @@ int hostname_to_ip(char *hostname , char *ip)
     freeaddrinfo(servinfo); // all done with this structure
     return 0;
 }
+// }}}
 
+// {{{ Function: truncatemem
 void truncatemem(char** recvbuf, int* recvbuflen, int offset)
 {
     char* tmp;
@@ -71,7 +91,32 @@ void truncatemem(char** recvbuf, int* recvbuflen, int offset)
     *recvbuf = tmp; 
     *recvbuflen = newsize;
 }
+// }}}
 
+int recvdata(int epfd, int fd, char** recvbuf, int* recvbuflen)
+{
+    char buf[BUFSIZ];
+    int n = 0, nread = 0;
+    while ((nread = read(fd, buf + n, BUFSIZ-1)) > 0) {
+        n += nread;
+    }
+    if (nread == -1 && errno != EAGAIN) {
+        perror("read error");
+    }
+    if (nread == 0) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        if(close(fd) != 0) {
+            perror("close");
+        }
+        return 1;
+    }
+    (*recvbuf) = (char*)realloc((*recvbuf), (*recvbuflen) + n*sizeof(char)); 
+    memcpy((*recvbuf) + (*recvbuflen), buf, n);
+    (*recvbuflen) = *recvbuflen + n;
+    return 0;
+}
+
+// {{{ Fucntion: Socks5StateMachineClient
 int Socks5StateMachineClient(int* state, int i, char** recvbuf, int* recvbuflen, char** sendbuf, int* sendbuflen)
 {
         if(*state == 0)
@@ -150,21 +195,17 @@ int Socks5StateMachineClient(int* state, int i, char** recvbuf, int* recvbuflen,
         }
         return 0;
 }
+// }}}
 
 int main(){
     struct epoll_event ev, events[MAX_EVENTS];
-    int addrlen, listenfd, conn_sock, nfds, epfd, fd, i, nread, n;
-    int flag = 1, len = sizeof(int);
+    int addrlen, listenfd, conn_sock, nfds, epfd, fd, i, n;
     struct sockaddr_in local, remote;
-    char buf[BUFSIZ];
     char* clientrecvbuf[MAX_EVENTS] = {NULL};
     char* clientsendbuf[MAX_EVENTS] = {NULL};
-    char* exchangeptr;
     int clientstatus[MAX_EVENTS] = {0};
     int clientsendbuflen[MAX_EVENTS] = {0};
     int clientrecvbuflen[MAX_EVENTS] = {0};
-    int clientrequestfd[MAX_EVENTS] = {0};
-    int requestclientfd[MAX_EVENTS] = {0};
 
     if( (listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("sockfd\n");
@@ -181,20 +222,22 @@ int main(){
     }
     listen(listenfd, 20);
 
-    epfd = epoll_create(MAX_EVENTS);
+    epfd = epoll_create(MAX_EVENTS); // Create epoll fd for accept client
     if (epfd == -1) {
         perror("epoll_create");
         exit(EXIT_FAILURE);
     }
 
     ev.events = EPOLLIN;
-    ev.data.fd = listenfd;
+    ev.data.ptr = malloc(sizeof(struct event_data));
+    ((struct event_data*)ev.data.ptr)->fd = listenfd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev) == -1) {
         perror("epoll_ctl: listen_sock");
         exit(EXIT_FAILURE);
     }
 
     for (;;) {
+        // {{{ Accept events process
         nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (nfds == -1) {
             perror("epoll_pwait");
@@ -202,13 +245,15 @@ int main(){
         }
 
         for (i = 0; i < nfds; ++i) {
-            fd = events[i].data.fd;
+            fd = ((struct event_data*)events[i].data.ptr)->fd;
             if (fd == listenfd) {
                 while ((conn_sock = accept(listenfd,(struct sockaddr *) &remote, 
                                 (socklen_t *)&addrlen)) > 0) {
                     setnonblocking(conn_sock);
                     ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-                    ev.data.fd = conn_sock;
+                    ev.data.ptr = malloc(sizeof(struct event_data));
+                    memset(ev.data.ptr, 0, sizeof(struct event_data)); // May cause strange problem. http://stackoverflow.com/questions/11152160/initializing-a-struct-to-0
+                    ((struct event_data*)ev.data.ptr)->fd = conn_sock;
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn_sock,
                                 &ev) == -1) {
                         perror("epoll_ctl: add");
@@ -223,6 +268,10 @@ int main(){
                 continue;
             }  
             if (events[i].events & EPOLLIN) {
+                if(recvdata(epfd, fd, &clientrecvbuf[i], &clientrecvbuflen[i]) != 0) {
+                    continue;
+                }
+                /*
                 n = 0;
                 while ((nread = read(fd, buf + n, BUFSIZ-1)) > 0) {
                     n += nread;
@@ -240,9 +289,11 @@ int main(){
                 clientrecvbuf[i] = (char*)realloc(clientrecvbuf[i], clientrecvbuflen[i] + n*sizeof(char)); 
                 memcpy(clientrecvbuf[i] + clientrecvbuflen[i], buf, n);
                 clientrecvbuflen[i] = clientrecvbuflen[i] + n;
+                */
                 printf("state 1  %d\n", clientstatus[i]);
                 
                 if(Socks5StateMachineClient(&clientstatus[i], i, &clientrecvbuf[i], &clientrecvbuflen[i], &clientsendbuf[i], &clientsendbuflen[i]) != 0) {
+                    free(events[i].data.ptr);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     if(close(fd) != 0) {
                         perror("close");
@@ -251,7 +302,7 @@ int main(){
                 }
                 printf("state 2  %d\n", clientstatus[i]);
 
-                ev.data.fd = fd;
+                ((struct event_data*)ev.data.ptr)->fd = fd;
                 ev.events = events[i].events | EPOLLOUT; // Listen for EPOLLOUT
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {
                     perror("epoll_ctl: mod");
@@ -278,13 +329,14 @@ int main(){
                 }
             }
             if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
+                free(events[i].data.ptr);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                 if(close(fd) != 0) {
                     perror("close");
                 }
             }
         }
+        // }}}
     }
-
     return 0;
 }
