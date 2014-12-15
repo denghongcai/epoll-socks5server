@@ -17,7 +17,7 @@
 
 #define MAX_EVENTS 200
 #define PORT 130
-#define BUFSIZE 102400
+#define BUFSIZE BUFSIZ
 
 struct event_data // Used by epoll_data_t.ptr
 {
@@ -90,32 +90,12 @@ void truncatemem(char** recvbuf, int* recvbuflen, int offset)
 }
 // }}}
 
-int recvdata(int epfd, int fd, char** recvbuf, int* recvbuflen)
-{
-    char buf[BUFSIZE];
-    int n = 0, nread = 0;
-    while ((nread = read(fd, buf + n, BUFSIZE-1)) > 0) {
-        n += nread;
-    }
-    if (nread == -1 && errno != EAGAIN) {
-        perror("read error");
-    }
-    if (nread == 0) {
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-        if(close(fd) != 0) {
-            perror("close");
-        }
-        return 1;
-    }
-    (*recvbuf) = (char*)realloc(*recvbuf, (*recvbuflen + n)*sizeof(char)); 
-    memcpy((*recvbuf) + (*recvbuflen), buf, n * sizeof(char));
-    (*recvbuflen) = *recvbuflen + n;
-    return 0;
-}
-
 // {{{ Function: rmfromepoll
 void rmfromepoll(int epfd, struct event_data* data_ptr)
 {
+    if(data_ptr->fd == 0) {
+        return;
+    }
     printf("disconnected\n");
     if(data_ptr->sendbuf != NULL) {
         free(data_ptr->sendbuf);
@@ -127,9 +107,37 @@ void rmfromepoll(int epfd, struct event_data* data_ptr)
     if(close(data_ptr->fd) != 0) {
         perror("close");
     }
+    data_ptr->fd = 0;
+    if(data_ptr->pairptr != NULL) {
+        rmfromepoll(epfd, data_ptr->pairptr);
+    }
     free(data_ptr);
 }
 // }}}
+
+int recvdata(int epfd, struct event_data* data_ptr, char** recvbuf, int* recvbuflen)
+{
+    char buf[BUFSIZE];
+    int n = 0, nread = 0;
+    while ((nread = read(data_ptr->fd, buf + n, BUFSIZE-1)) > 0) {
+        n += nread;
+    }
+
+    if (nread == -1 && errno != EAGAIN) {
+        perror("read error");
+    }
+    if (nread == 0) {
+        rmfromepoll(epfd, data_ptr);
+        return 1;
+    }
+
+    printf("recvbuflen: %d\n", n);
+
+    (*recvbuf) = (char*)realloc(*recvbuf, (*recvbuflen + n)*sizeof(char)); 
+    memcpy((*recvbuf) + (*recvbuflen), buf, n * sizeof(char));
+    (*recvbuflen) = *recvbuflen + n;
+    return 0;
+}
 
 // {{{ Fucntion: Socks5StateMachineClient
 int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
@@ -153,6 +161,9 @@ int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
             *state = 1;
             printf("handshake\n");
         } 
+        else {
+            *state = -1;
+        }
     }
     else if(*state == 1)
     {
@@ -170,6 +181,9 @@ int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
                         truncatemem(recvbuf, recvbuflen, 8); 
                         port = ntohs(*(uint16_t*)(*recvbuf)); // net order to host order
                         truncatemem(recvbuf, recvbuflen, 2); 
+                    }
+                    else {
+                        *state = -1;
                     }
                     break;
                 case 0x03: // Domain, not implement yet
@@ -190,6 +204,9 @@ int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
                     response = 0x08;
                     break;
             }
+        }
+        else {
+            *state = -1;
         }
         if(strnlen(ipaddress, 8) != 0 && response == 0x07) {
             printf("request %s:%u\n", ipaddress, port); 
@@ -236,6 +253,9 @@ int Socks5StateMachineClient(struct event_data* data_ptr, int epfd)
             data_ptr->pairptr = ev.data.ptr;
 
             *state = 2;
+        }
+        else {
+            *state = -1;
         }
     }
     else if(*state == 2) {
@@ -329,8 +349,7 @@ int main(){
                 continue;
             }  
             if (events[i].events & EPOLLIN) {
-                printf("recv\n");
-                if(recvdata(epfd, fd, &(data_ptr->recvbuf), &(data_ptr->recvbuflen)) != 0) {
+                if(recvdata(epfd, data_ptr, &(data_ptr->recvbuf), &(data_ptr->recvbuflen)) != 0) {
                     continue;
                 }
                 if(data_ptr->type == 0) {
@@ -374,7 +393,7 @@ int main(){
                     data_ptr->sendbuflen = 0;
                 }
             }
-            if (events[i].events & (EPOLLRDHUP | EPOLLERR)) {
+            if ((events[i].events & EPOLLRDHUP) || (events[i].events & EPOLLERR)) {
                 rmfromepoll(epfd, data_ptr);
             }
         }
