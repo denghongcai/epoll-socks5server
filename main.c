@@ -264,16 +264,20 @@ int Socks5StateMachineClient(int epfd, struct event_data* data_ptr)
                         *state = -1;
                     }
                     break;
-                case 0x03: // Domain, not implement yet
+                case 0x03: // Domain
                     {
                         int offset = 0;
                         char domainlen = (*recvbuf)[4];
-                        char* domain = (char*)malloc(((unsigned int)(unsigned char)domainlen)*sizeof(char));
+                        char* domain = (char*)malloc(((unsigned int)(unsigned char)domainlen)*sizeof(char) + 1);
+                        memset(domain, 0, ((unsigned int)(unsigned char)domainlen)*sizeof(char) + 1);
                         memcpy(domain, *recvbuf + 5, (unsigned int)domainlen);
                         hostname_to_ip(domain, ipaddress);
+                        printf("domain: %s\n", ipaddress);
                         free(domain); 
                         offset += 1 + (unsigned int)domainlen;
                         truncatemem(recvbuf, recvbuflen, 4 + offset);
+                        port = ntohs(*(uint16_t*)(*recvbuf)); // net order to host order
+                        truncatemem(recvbuf, recvbuflen, 2); 
                     }
                     break;
                 case 0x04:
