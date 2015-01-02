@@ -15,6 +15,23 @@
 #include <fcntl.h>
 #include <errno.h> 
 
+#define DEBUG_INFO 1
+#define DEBUG_WARN 2
+#define DEBUG_ERR  3
+
+#define DEBUG_LEVEL DEBUG_ERR // Set debug mode and debug level
+
+#if defined(DEBUG) && DEBUG_LEVEL > 0
+ #define DEBUG_PRINT(level, fmt, args...) do { \
+     if(level <= DEBUG) { \
+         fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt, \
+             __FILE__, __LINE__, __func__, ##args); \
+     } \
+ } while(0)
+#else
+ #define DEBUG_PRINT(fmt, args...) /* Don't do anything in release builds */
+#endif
+
 #define MAX_EVENTS 200
 #define PORT 130
 
@@ -62,7 +79,7 @@ int hostname_to_ip(char *hostname , char *ip)
  
     if ( (rv = getaddrinfo( hostname , "http" , &hints , &servinfo)) != 0) 
     {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        DEBUG_PRINT(DEBUG_ERR, "getaddrinfo: %s\n", gai_strerror(rv));
         return 1;
     }
  
@@ -97,7 +114,7 @@ void rmfromepoll(int epfd, struct event_data* data_ptr)
     if(data_ptr->fd == 0) {
         return;
     }
-    printf("disconnected, type: %d\n", data_ptr->type);
+    DEBUG_PRINT(DEBUG_INFO, "disconnected, type: %d\n", data_ptr->type);
     if(data_ptr->sendbuf != NULL) {
         free(data_ptr->sendbuf);
     }
@@ -142,11 +159,7 @@ int recvdata(int epfd, struct event_data* data_ptr)
         return -1;
     }
 
-    printf("recvlen: %d, type: %d\n", n, data_ptr->type);
-    /*
-    printf("recvbuflen: %d\n", *recvbuflen);
-    printf("recvbuf realloc buflen: %d\n", *recvbuflen + n);
-    */
+    DEBUG_PRINT(DEBUG_INFO, "recvlen: %d, type: %d\n", n, data_ptr->type);
 
     (*recvbuf) = (char*)realloc(*recvbuf, (*recvbuflen + n)*sizeof(char)); 
     memcpy((*recvbuf) + (*recvbuflen), buf, n * sizeof(char));
@@ -168,7 +181,7 @@ int senddata(int epfd, struct event_data* data_ptr)
 {
     if( data_ptr->writestate == 0 ) {
         if((data_ptr->sendbuf) != NULL) {
-            printf("sendlen: %d\n", data_ptr->sendbuflen);
+            DEBUG_PRINT(DEBUG_INFO, "sendlen: %d\n", data_ptr->sendbuflen);
             int nwrite, data_size = data_ptr->sendbuflen;
             int n = data_ptr->sendbuflen;
             while (n > 0) {
@@ -189,13 +202,13 @@ int senddata(int epfd, struct event_data* data_ptr)
                         }
 
                         data_ptr->writestate = 1;
-                        printf("EAGAIN, %d\n", data_ptr->type);
+                        DEBUG_PRINT(DEBUG_INFO, "EAGAIN, %d\n", data_ptr->type);
                     }
                     break;
                 }
                 n -= nwrite;
             }
-            printf("sentlen: %d\n", data_ptr->sendbuflen - n);
+            DEBUG_PRINT(DEBUG_INFO, "sentlen: %d\n", data_ptr->sendbuflen - n);
             if(n == 0){
                 free(data_ptr->sendbuf);
                 data_ptr->sendbuf = NULL;
@@ -237,7 +250,7 @@ int Socks5StateMachineClient(int epfd, struct event_data* data_ptr)
             memcpy(*sendbuf, response, 2); // Response of Socks5 protocal handshake ( no validation )
             *sendbuflen = 2;
             *state = 1;
-            printf("handshake\n");
+            DEBUG_PRINT(DEBUG_INFO, "handshake\n");
         } 
         else {
             *state = -1;
@@ -248,9 +261,9 @@ int Socks5StateMachineClient(int epfd, struct event_data* data_ptr)
         char response = 0x07;
         char ipaddress[20] = {0};
         uint16_t port;
-        printf("decode request recvbuflen %d\n", *recvbuflen);
+        DEBUG_PRINT(DEBUG_INFO, "decode request recvbuflen %d\n", *recvbuflen);
         if(*recvbuflen > 4) {
-            printf("decode request atyp %d\n", (unsigned int)(*recvbuf)[3]);
+            DEBUG_PRINT(DEBUG_INFO, "decode request atyp %d\n", (unsigned int)(*recvbuf)[3]);
             switch((unsigned int)(*recvbuf)[3])
             {
                 case 0x01: // IPv4
@@ -272,7 +285,7 @@ int Socks5StateMachineClient(int epfd, struct event_data* data_ptr)
                         memset(domain, 0, ((unsigned int)(unsigned char)domainlen)*sizeof(char) + 1);
                         memcpy(domain, *recvbuf + 5, (unsigned int)domainlen);
                         hostname_to_ip(domain, ipaddress);
-                        printf("domain: %s\n", ipaddress);
+                        DEBUG_PRINT(DEBUG_INFO, "domain: %s\n", ipaddress);
                         free(domain); 
                         offset += 1 + (unsigned int)domainlen;
                         truncatemem(recvbuf, recvbuflen, 4 + offset);
@@ -291,7 +304,7 @@ int Socks5StateMachineClient(int epfd, struct event_data* data_ptr)
             *state = -1;
         }
         if(strnlen(ipaddress, 8) != 0 && response == 0x07) {
-            printf("request %s:%u\n", ipaddress, port); 
+            DEBUG_PRINT(DEBUG_INFO, "request %s:%u\n", ipaddress, port); 
             response = 0x00;
             *sendbuf = (char*)malloc(10 * sizeof(char));
             (*sendbuf)[0] = 0x05;
@@ -460,7 +473,7 @@ int main(){
                 }
             }
             if (events[i].events & EPOLLOUT) {
-                printf("EPOLLOUT %d\n", data_ptr->type);
+                DEBUG_PRINT(DEBUG_INFO, "EPOLLOUT %d\n", data_ptr->type);
                 ev.data.ptr = data_ptr;
                 ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLET; // Remove listener for EPOLLOUT
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {

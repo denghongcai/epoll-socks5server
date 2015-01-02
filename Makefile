@@ -1,10 +1,14 @@
 CC=gcc
-CFLAGS=-pg -g -Wall
+DEBUGCFLAGS=-DDEBUG -pg -g -Wall
+RELEASECFLAGS=-Wall -O2 -s -DNDEBUG
 
-all: main
+all: release
 
-main: main.c
-	$(CC) $(CFLAGS) main.c -o epoll-socks5server
+debug: main.c
+	$(CC) $(DEBUGCFLAGS) main.c -o epoll-socks5server
+
+release: main.c
+	$(CC) $(RELEASECFLAGS) main.c -o epoll-socks5server
 
 clean:
 	rm -rf epoll-socks5server
