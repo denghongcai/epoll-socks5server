@@ -15,15 +15,15 @@
 #include <fcntl.h>
 #include <errno.h> 
 
-#define DEBUG_INFO 1
+#define DEBUG_INFO 3
 #define DEBUG_WARN 2
-#define DEBUG_ERR  3
+#define DEBUG_ERR  1
 
 #define DEBUG_LEVEL DEBUG_ERR // Set debug mode and debug level
 
 #if defined(DEBUG) && DEBUG_LEVEL > 0
  #define DEBUG_PRINT(level, fmt, args...) do { \
-     if(level <= DEBUG) { \
+     if(level <= DEBUG_LEVEL) { \
          fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt, \
              __FILE__, __LINE__, __func__, ##args); \
      } \
